@@ -2,9 +2,13 @@
 #![feature(unsize)]
 #![feature(coerce_unsized)]
 
-use ptr::NonNull;
 use std::{
-    cell::Cell, marker::PhantomData, marker::Unsize, mem, ops::CoerceUnsized, ops::Deref, ptr,
+    cell::Cell,
+    marker::{PhantomData, Unsize},
+    mem,
+    ops::{CoerceUnsized, Deref},
+    ptr,
+    ptr::NonNull,
 };
 
 type TypedDropFn<T> = fn(Box<T>);
