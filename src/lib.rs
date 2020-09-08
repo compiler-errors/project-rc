@@ -1,6 +1,7 @@
 #![feature(extern_types)]
 #![feature(unsize)]
 #![feature(coerce_unsized)]
+#![warn(clippy::pedantic)]
 
 use std::{
     cell::Cell,
@@ -11,10 +12,14 @@ use std::{
     ptr::NonNull,
 };
 
+// The "typed" flavor of a function which drops Box<T>
 type TypedDropFn<T> = fn(Box<T>);
+// The "untyped"/type-erased flavor of a function which drops Box<...>
 type ErasedDropFn = fn(Box<()>);
-fn do_drop<T: ?Sized>(_: Box<T>) {}
 
+/// The "information" struct, which contains the strong pointer count,
+// the base of the memory allocation, and the drop function which is invoked
+// when this memory is finally dropped.
 struct ProjectionInfo {
     strong: Cell<usize>,
     erased_base: NonNull<()>,
@@ -35,12 +40,16 @@ impl<T> ProjectRc<T> {
 
 impl<T: ?Sized> ProjectRc<T> {
     pub fn from_box(t: Box<T>) -> ProjectRc<T> {
+        // Leak the data out of the box. We'll be taking the pointer to this
+        // data which is the base of our future projections.
         let data = Box::leak(t);
         // Erase the type of this data, because we don't want the obligation of
         // carrying this around. This is the point of the ProjectRc.
         let erased_base = unsafe { NonNull::new_unchecked(data as *mut T as *mut ()) };
+        // Also, we need to erase a "drop" fn for this type, which we'll pass
+        // `erased_base` back into when the time is right to get rid of this data.
         let erased_drop_fn =
-            unsafe { mem::transmute::<TypedDropFn<T>, ErasedDropFn>(do_drop::<T>) };
+            unsafe { mem::transmute::<TypedDropFn<T>, ErasedDropFn>(mem::drop::<Box<T>>) };
 
         ProjectRc {
             info: Box::leak(Box::new(ProjectionInfo {
@@ -54,6 +63,11 @@ impl<T: ?Sized> ProjectRc<T> {
         }
     }
 
+    /// Make a ProjectRc from an (exclusively-owned) pointer to T.
+    ///
+    /// Safety:
+    ///
+    /// Must own the data pointed to by the pointer `t`.
     pub unsafe fn from_raw(t: *mut T) -> ProjectRc<T> {
         Self::from_box(Box::from_raw(t))
     }
@@ -64,15 +78,22 @@ impl<T: ?Sized> Drop for ProjectRc<T> {
         let mut info = self.info;
         let strong_count = unsafe { info.as_ref() }.strong.get();
 
+        // If we exclusively own this pointer,
         if strong_count == 1 {
             unsafe {
+                // Get the erased base and drop fn back from the info struct.
                 let mut erased_base = info.as_ref().erased_base;
                 let erased_drop_fn = info.as_ref().erased_drop_fn;
+                // Drop the info struct.
                 ptr::drop_in_place(info.as_mut());
+                // Then invoke the erased drop fn. This will both do any
+                // drop-time functionality and also deallocate the data, since
+                // we've boxed it back up.
                 erased_drop_fn(Box::from_raw(erased_base.as_mut()))
             }
         } else {
             unsafe {
+                // Otherwise decrement the strong-count.
                 self.info.as_ref().strong.set(strong_count - 1);
             }
         }
@@ -81,6 +102,7 @@ impl<T: ?Sized> Drop for ProjectRc<T> {
 
 impl<T: ?Sized> Clone for ProjectRc<T> {
     fn clone(&self) -> Self {
+        // Increment the strong-count and clone the info in the ProjectRc.
         unsafe {
             let info = self.info.as_ref();
             info.strong.set(info.strong.get() + 1);
@@ -98,16 +120,23 @@ impl<T: ?Sized> Deref for ProjectRc<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
+        // Deref'ing the ProjectRc is just deref'ing the data pointer.
         unsafe { self.data.as_ref() }
     }
 }
 
+// Spicy
 impl<T: ?Sized, U: ?Sized> CoerceUnsized<ProjectRc<U>> for ProjectRc<T> where T: Unsize<U> {}
 
 impl<T: ?Sized> ProjectRc<T> {
+    // Given a projection fn (&T -> &S), project this ProjectRc<T> into
+    // a ProjectRc<S>. The HRTB is here to ensure that we're as flexible as
+    // possible with the projection function.
     pub fn project<S: ?Sized>(self, f: impl for<'a> Fn(&'a T) -> &'a S) -> ProjectRc<S> {
         let info = self.info;
         let data = self.data;
+
+        // Forget self so we don't free the data if the projection function panicks.
         std::mem::forget(self);
 
         ProjectRc {
@@ -122,11 +151,13 @@ impl<T: ?Sized> ProjectRc<T>
 where
     T: Deref,
 {
+    // Convenience function for projecting across a Deref::deref
     pub fn project_deref(self) -> ProjectRc<T::Target> {
-        self.project(|self_| self_.deref())
+        self.project(T::deref)
     }
 }
 
+/// Convenience from/into for taking ownership of a boxed type
 impl<T: ?Sized> From<Box<T>> for ProjectRc<T> {
     fn from(b: Box<T>) -> Self {
         Self::from_box(b)
@@ -139,10 +170,24 @@ impl From<&'static str> for ProjectRc<str> {
     }
 }
 
+impl From<String> for ProjectRc<str> {
+    fn from(s: String) -> Self {
+        Self::from_box(s.into())
+    }
+}
+
+impl<T> From<Vec<T>> for ProjectRc<[T]> {
+    fn from(s: Vec<T>) -> Self {
+        Self::from_box(s.into())
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
 
+    /// Convenient little struct that'll call the side-effect function F when
+    // the struct is dropped.
     struct SideEffect<T, F: Fn(&mut T)>(T, F);
 
     impl<T, F: Fn(&mut T)> Drop for SideEffect<T, F> {
