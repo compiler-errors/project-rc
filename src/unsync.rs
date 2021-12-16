@@ -1,45 +1,57 @@
-use core::{
-    alloc::Layout,
+use std::{
+    alloc::{alloc, handle_alloc_error, Layout},
     cell::Cell,
-    marker::Unsize,
     mem::ManuallyDrop,
-    ops::{CoerceUnsized, Deref},
-    ptr::{DynMetadata, NonNull},
+    ops::Deref,
+    ptr::{null_mut, NonNull},
 };
-use std::alloc::{handle_alloc_error, Allocator, Global};
+
+use crate::metadata::{drop_in_place, metadata_of, TypeMetadata};
 
 pub struct ProjectRc<T: ?Sized> {
-    inner: NonNull<ArcInner>,
+    inner: NonNull<RcInner>,
     pointer: NonNull<T>,
 }
 
 impl<T> ProjectRc<T> {
     pub fn new(thing: T) -> Self {
-        let layout = arc_inner_layout(core::mem::size_of::<T>(), core::mem::align_of::<T>());
-        let meta = drop_meta::<T>();
+        let meta = metadata_of::<T>();
+        let layout = rc_inner_layout(meta);
 
-        let ptr = match Global.allocate(layout.layout) {
-            Ok(ptr) => ptr.as_mut_ptr(),
-            Err(_) => handle_alloc_error(layout.layout),
-        };
+        let ptr = unsafe { alloc(layout.layout) };
+
+        if ptr == null_mut() {
+            handle_alloc_error(layout.layout);
+        }
 
         unsafe {
+            // Write 0 as the strong count
             ptr.add(layout.strong_offset)
                 .cast::<Cell<usize>>()
                 .write(Cell::new(1));
+            // Write the metadata
             ptr.add(layout.drop_offset)
-                .cast::<DynMetadata<_>>()
+                .cast::<TypeMetadata>()
                 .write(meta);
+            // Write the actual pointee
             ptr.add(layout.payload_offset).cast::<T>().write(thing);
 
-            let inner_ptr = NonNull::new_unchecked(ptr as *mut ArcInner);
-            let payload_ptr = NonNull::new_unchecked(ptr.add(layout.payload_offset) as *mut T);
+            let inner_ptr = NonNull::new(ptr as *mut RcInner).unwrap();
+            let payload_ptr = NonNull::new(ptr.add(layout.payload_offset) as *mut T).unwrap();
 
             ProjectRc {
                 inner: inner_ptr,
                 pointer: payload_ptr,
             }
         }
+    }
+}
+
+impl<T: ?Sized> ProjectRc<T> {
+    /// SAFETY: As long as self is alive, we will have one reference pointing to
+    /// the inner. Therefore it shall be valid.
+    fn inner(&self) -> &RcInner {
+        unsafe { self.inner.as_ref() }
     }
 }
 
@@ -57,21 +69,11 @@ impl<T: ?Sized> ProjectRc<T> {
         }
     }
 
-    pub fn project_clone<F, U>(&self, f: F) -> ProjectRc<U>
+    pub fn clone_project<F, U>(&self, f: F) -> ProjectRc<U>
     where
         F: for<'a> FnOnce(&'a T) -> &'a U,
     {
         self.clone().project(f)
-    }
-
-    fn inner(&self) -> &ArcInner {
-        unsafe { self.inner.as_ref() }
-    }
-}
-
-impl<T: Deref + ?Sized> ProjectRc<T> {
-    pub fn project_deref(self) -> ProjectRc<T::Target> {
-        self.project(T::deref)
     }
 }
 
@@ -108,66 +110,62 @@ impl<T: ?Sized> Drop for ProjectRc<T> {
     }
 }
 
-impl<T, U> CoerceUnsized<ProjectRc<U>> for ProjectRc<T>
-where
-    T: Unsize<U> + ?Sized,
-    U: ?Sized,
-{
-}
+common_impls!(ProjectRc);
 
-#[repr(C)]
-struct ArcInner {
-    strong: Cell<usize>,
-    drop: DynMetadata<dyn Droppable>,
-    // payload: [u8],
-}
+#[cfg(feature = "unsize")]
+mod unsize_impl {
+    use std::marker::Unsize;
+    use std::ops::CoerceUnsized;
 
-unsafe fn deallocate(inner: NonNull<ArcInner>) {
-    let meta = unsafe { (*inner.as_ptr()).drop };
-    let layout = arc_inner_layout(meta.size_of(), meta.align_of());
-
-    unsafe {
-        let payload = (inner.as_ptr() as *mut u8).add(layout.payload_offset) as *mut ();
-        let payload: *mut dyn Droppable = core::ptr::from_raw_parts_mut(payload, meta);
-        core::ptr::drop_in_place(payload);
-
-        Global.deallocate(inner.cast::<u8>(), layout.layout);
+    impl<T, U> CoerceUnsized<ProjectRc<U>> for ProjectRc<T>
+    where
+        T: Unsize<U> + ?Sized,
+        U: ?Sized,
+    {
     }
 }
 
-struct ArcInnerLayout {
+#[repr(C)]
+struct RcInner {
+    strong: Cell<usize>,
+    drop: TypeMetadata,
+    // payload: [u8],
+}
+
+unsafe fn deallocate(inner: NonNull<RcInner>) {
+    let meta = unsafe { (*inner.as_ptr()).drop };
+    let layout = rc_inner_layout(meta);
+
+    let inner_ptr = inner.as_ptr() as *mut u8;
+    let payload = inner_ptr.add(layout.payload_offset) as *mut ();
+
+    unsafe {
+        drop_in_place(payload, meta);
+        std::alloc::dealloc(inner_ptr, layout.layout);
+    }
+}
+
+struct RcInnerLayout {
     layout: Layout,
     strong_offset: usize,
     drop_offset: usize,
     payload_offset: usize,
 }
 
-fn arc_inner_layout(size: usize, align: usize) -> ArcInnerLayout {
+fn rc_inner_layout(meta: TypeMetadata) -> RcInnerLayout {
     let (layout, strong_offset) = (Layout::new::<Cell<usize>>(), 0);
-    let (layout, drop_offset) = layout
-        .extend(Layout::new::<DynMetadata<dyn Droppable>>())
-        .unwrap();
+    let (layout, drop_offset) = layout.extend(Layout::new::<TypeMetadata>()).unwrap();
     let (layout, payload_offset) = layout
-        .extend(Layout::from_size_align(size, align).unwrap())
+        .extend(Layout::from_size_align(meta.size_of(), meta.align_of()).unwrap())
         .unwrap();
     let layout = layout.pad_to_align();
 
-    ArcInnerLayout {
+    RcInnerLayout {
         layout,
         strong_offset,
         drop_offset,
         payload_offset,
     }
-}
-
-trait Droppable {}
-
-impl<T> Droppable for T {}
-
-fn drop_meta<'a, T: 'a>() -> DynMetadata<dyn Droppable + 'a> {
-    (core::ptr::null::<T>() as *const dyn Droppable)
-        .to_raw_parts()
-        .1
 }
 
 #[cfg(test)]

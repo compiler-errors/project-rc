@@ -1,9 +1,8 @@
-#![feature(slice_ptr_get)]
-#![feature(allocator_api)]
-#![feature(ptr_metadata)]
-#![feature(unsize)]
-#![feature(coerce_unsized)]
+#![cfg_attr(feature = "unsize", feature(unsize, coerce_unsized))]
 
+#[macro_use]
+mod common_impls;
+mod metadata;
 mod sync;
 mod unsync;
 

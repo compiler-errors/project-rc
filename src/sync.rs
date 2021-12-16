@@ -1,12 +1,12 @@
-use core::{
-    alloc::Layout,
-    marker::Unsize,
+use std::{
+    alloc::{alloc, handle_alloc_error, Layout},
     mem::ManuallyDrop,
-    ops::{CoerceUnsized, Deref},
-    ptr::{DynMetadata, NonNull},
+    ops::Deref,
+    ptr::{null_mut, NonNull},
     sync::atomic::{AtomicUsize, Ordering},
 };
-use std::alloc::{handle_alloc_error, Allocator, Global};
+
+use crate::metadata::{drop_in_place, metadata_of, TypeMetadata};
 
 pub struct ProjectArc<T: ?Sized> {
     inner: NonNull<ArcInner>,
@@ -15,31 +15,43 @@ pub struct ProjectArc<T: ?Sized> {
 
 impl<T> ProjectArc<T> {
     pub fn new(thing: T) -> Self {
-        let layout = arc_inner_layout(core::mem::size_of::<T>(), core::mem::align_of::<T>());
-        let meta = drop_meta::<T>();
+        let meta = metadata_of::<T>();
+        let layout = arc_inner_layout(meta);
 
-        let ptr = match Global.allocate(layout.layout) {
-            Ok(ptr) => ptr.as_mut_ptr(),
-            Err(_) => handle_alloc_error(layout.layout),
-        };
+        let ptr = unsafe { alloc(layout.layout) };
+
+        if ptr == null_mut() {
+            handle_alloc_error(layout.layout);
+        }
 
         unsafe {
+            // Write 0 as the strong count
             ptr.add(layout.strong_offset)
                 .cast::<AtomicUsize>()
                 .write(AtomicUsize::new(1));
+            // Write the metadata
             ptr.add(layout.drop_offset)
-                .cast::<DynMetadata<_>>()
+                .cast::<TypeMetadata>()
                 .write(meta);
+            // Write the actual pointee
             ptr.add(layout.payload_offset).cast::<T>().write(thing);
 
-            let inner_ptr = NonNull::new_unchecked(ptr as *mut ArcInner);
-            let payload_ptr = NonNull::new_unchecked(ptr.add(layout.payload_offset) as *mut T);
+            let inner_ptr = NonNull::new(ptr as *mut ArcInner).unwrap();
+            let payload_ptr = NonNull::new(ptr.add(layout.payload_offset) as *mut T).unwrap();
 
             ProjectArc {
                 inner: inner_ptr,
                 pointer: payload_ptr,
             }
         }
+    }
+}
+
+impl<T: ?Sized> ProjectArc<T> {
+    /// SAFETY: As long as self is alive, we will have one reference pointing to
+    /// the inner. Therefore it shall be valid.
+    fn inner(&self) -> &ArcInner {
+        unsafe { self.inner.as_ref() }
     }
 }
 
@@ -57,27 +69,17 @@ impl<T: ?Sized> ProjectArc<T> {
         }
     }
 
-    pub fn project_clone<F, U>(&self, f: F) -> ProjectArc<U>
+    pub fn clone_project<F, U>(&self, f: F) -> ProjectArc<U>
     where
         F: for<'a> FnOnce(&'a T) -> &'a U,
     {
         self.clone().project(f)
-    }
-
-    fn inner(&self) -> &ArcInner {
-        unsafe { self.inner.as_ref() }
     }
 }
 
 unsafe impl<T> Send for ProjectArc<T> where T: Send + Sync + ?Sized {}
 
 unsafe impl<T> Sync for ProjectArc<T> where T: Send + Sync + ?Sized {}
-
-impl<T: Deref + ?Sized> ProjectArc<T> {
-    pub fn project_deref(self) -> ProjectArc<T::Target> {
-        self.project(T::deref)
-    }
-}
 
 impl<T: ?Sized> Deref for ProjectArc<T> {
     type Target = T;
@@ -110,30 +112,38 @@ impl<T: ?Sized> Drop for ProjectArc<T> {
     }
 }
 
-impl<T, U> CoerceUnsized<ProjectArc<U>> for ProjectArc<T>
-where
-    T: Unsize<U> + ?Sized,
-    U: ?Sized,
-{
+common_impls!(ProjectArc);
+
+#[cfg(feature = "unsize")]
+mod unsize_impl {
+    use std::marker::Unsize;
+    use std::ops::CoerceUnsized;
+
+    impl<T, U> CoerceUnsized<ProjectRc<U>> for ProjectRc<T>
+    where
+        T: Unsize<U> + ?Sized,
+        U: ?Sized,
+    {
+    }
 }
 
 #[repr(C)]
 struct ArcInner {
     strong: AtomicUsize,
-    drop: DynMetadata<dyn Droppable>,
+    drop: TypeMetadata,
     // payload: [u8],
 }
 
 unsafe fn deallocate(inner: NonNull<ArcInner>) {
     let meta = unsafe { (*inner.as_ptr()).drop };
-    let layout = arc_inner_layout(meta.size_of(), meta.align_of());
+    let layout = arc_inner_layout(meta);
+
+    let inner_ptr = inner.as_ptr() as *mut u8;
+    let payload = inner_ptr.add(layout.payload_offset) as *mut ();
 
     unsafe {
-        let payload = (inner.as_ptr() as *mut u8).add(layout.payload_offset) as *mut ();
-        let payload: *mut dyn Droppable = core::ptr::from_raw_parts_mut(payload, meta);
-        core::ptr::drop_in_place(payload);
-
-        Global.deallocate(inner.cast::<u8>(), layout.layout);
+        drop_in_place(payload, meta);
+        std::alloc::dealloc(inner_ptr, layout.layout);
     }
 }
 
@@ -144,13 +154,11 @@ struct ArcInnerLayout {
     payload_offset: usize,
 }
 
-fn arc_inner_layout(size: usize, align: usize) -> ArcInnerLayout {
+fn arc_inner_layout(meta: TypeMetadata) -> ArcInnerLayout {
     let (layout, strong_offset) = (Layout::new::<AtomicUsize>(), 0);
-    let (layout, drop_offset) = layout
-        .extend(Layout::new::<DynMetadata<dyn Droppable>>())
-        .unwrap();
+    let (layout, drop_offset) = layout.extend(Layout::new::<TypeMetadata>()).unwrap();
     let (layout, payload_offset) = layout
-        .extend(Layout::from_size_align(size, align).unwrap())
+        .extend(Layout::from_size_align(meta.size_of(), meta.align_of()).unwrap())
         .unwrap();
     let layout = layout.pad_to_align();
 
@@ -160,16 +168,6 @@ fn arc_inner_layout(size: usize, align: usize) -> ArcInnerLayout {
         drop_offset,
         payload_offset,
     }
-}
-
-trait Droppable {}
-
-impl<T> Droppable for T {}
-
-fn drop_meta<'a, T: 'a>() -> DynMetadata<dyn Droppable + 'a> {
-    (core::ptr::null::<T>() as *const dyn Droppable)
-        .to_raw_parts()
-        .1
 }
 
 #[cfg(test)]
